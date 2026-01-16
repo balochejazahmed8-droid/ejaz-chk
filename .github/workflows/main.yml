@@ -1,0 +1,193 @@
+name: RDP with Bitcoin Tools
+
+on: workflow_dispatch
+
+jobs:
+  setup:
+    runs-on: windows-latest
+    timeout-minutes: 300
+
+    steps:
+      - name: Connect Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          authkey: ${{ secrets.TS_AUTH_KEY }}
+
+      - name: Get Tailscale IP
+        shell: powershell
+        run: |
+          Start-Sleep -Seconds 10
+          $ip = (tailscale ip -4).Trim()
+          if ($ip) {
+            Write-Output $ip | Out-File -FilePath "$env:GITHUB_WORKSPACE\ip.txt" -Encoding ascii
+            Write-Host "Tailscale IP: $ip"
+          } else {
+            Write-Host "ERROR: Failed to get Tailscale IP"
+            exit 1
+          }
+
+      - name: Enable RDP and Create User
+        shell: powershell
+        run: |
+          # Enable RDP
+          Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name "UserAuthentication" -Value 0 -Force
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
+          New-NetFirewallRule -DisplayName "RDP Custom" -Direction Inbound -Protocol TCP -LocalPort 3389 -Action Allow -ErrorAction SilentlyContinue
+          
+          # Create user using net command (simpler)
+          $username = "rdpuser"
+          $passPlain = -join ((65..90) + (97..122) + (48..57) | Get-Random -Count 16 | ForEach-Object {[char]$_})
+          
+          # Delete if exists and create new (ignore delete errors)
+          net user $username /delete 2>$null
+          net user $username $passPlain /add /y
+          net localgroup Administrators $username /add
+          net localgroup "Remote Desktop Users" $username /add
+          
+          # Set environment variable - THIS IS THE FIXED LINE!
+          "PASSWORD=$passPlain" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "User created: $username"
+
+      - name: Setup Bitcoin Vanity Tools
+        shell: powershell
+        run: |
+          $toolsDir = "C:\BitcoinVanity"
+          New-Item -ItemType Directory -Path $toolsDir -Force | Out-Null
+
+          Write-Host "Downloading VanitySearch v1.19..."
+          $vsUrl = "https://github.com/JeanLucPons/VanitySearch/releases/download/1.19/VanitySearch.exe"
+          $vsPath = "$toolsDir\VanitySearch.exe"
+
+          try {
+            $retryCount = 0
+            $maxRetries = 3
+            while ($retryCount -lt $maxRetries) {
+              try {
+                Invoke-WebRequest -Uri $vsUrl -OutFile $vsPath -UseBasicParsing -TimeoutSec 120
+                Write-Host "VanitySearch downloaded successfully"
+                break
+              } catch {
+                $retryCount++
+                Write-Host "Download attempt $retryCount failed: $_"
+                if ($retryCount -eq $maxRetries) {
+                  throw
+                }
+                Start-Sleep -Seconds 5
+              }
+            }
+          } catch {
+            Write-Host "Warning: Failed to download VanitySearch, continuing anyway"
+          }
+
+          # Create README
+          $readmeLines = @(
+            "Bitcoin Vanity Address Generator (v1.19)",
+            "",
+            "File: VanitySearch.exe is ready in this folder.",
+            "",
+            "Quick examples:",
+            "  VanitySearch.exe 1Ejaz         # Search for addresses starting with 1Ejaz",
+            "  VanitySearch.exe -t 0 1Love    # Use all CPU threads",
+            "  VanitySearch.exe -gpu 1My      # Try GPU mode (not available on GitHub)",
+            "",
+            "More options:",
+            "  VanitySearch.exe --help"
+          )
+          $readmeContent = $readmeLines -join "`r`n"
+          Set-Content -Path "$toolsDir\README.txt" -Value $readmeContent -Encoding UTF8
+
+          # Create batch file
+          $batLines = @(
+            "@echo off",
+            "title Bitcoin Vanity Tools",
+            "echo Bitcoin Vanity Address Generator",
+            "echo ================================",
+            "echo.",
+            "echo Tool: VanitySearch.exe",
+            "echo Location: %~dp0",
+            "echo.",
+            "echo Examples:",
+            "echo   VanitySearch.exe 1Ejaz",
+            "echo   VanitySearch.exe -t 0 1Love",
+            "echo.",
+            "echo Check README.txt for more details",
+            "echo.",
+            "pause"
+          )
+          $batContent = $batLines -join "`r`n"
+          Set-Content -Path "$toolsDir\start.bat" -Value $batContent -Encoding ASCII
+
+          Write-Host "Tools folder created: $toolsDir"
+
+      - name: Show Connection Info
+        shell: powershell
+        run: |
+          Write-Host ""
+          Write-Host "======================================"
+          Write-Host "    RDP + BITCOIN VANITY TOOLS READY"
+          Write-Host "======================================"
+          Write-Host ""
+
+          $ipPath = "$env:GITHUB_WORKSPACE\ip.txt"
+          if (Test-Path $ipPath) {
+            $ip = Get-Content $ipPath -Raw
+            Write-Host "Tailscale IP: $ip"
+            Write-Host "Connect: mstsc /v:$ip"
+          } else {
+            Write-Host "ERROR: No IP file found"
+          }
+
+          Write-Host ""
+          Write-Host "Username: rdpuser"
+          Write-Host "Password: $($env:PASSWORD)"
+          Write-Host ""
+          Write-Host "Tools location: C:\BitcoinVanity"
+          Write-Host ""
+          Write-Host "Note: Session will stay active for 5 hours"
+          Write-Host "======================================"
+
+      - name: Keep Session Alive
+        shell: powershell
+        run: |
+          Write-Host "Starting keep-alive session..."
+          
+          function Move-Mouse {
+            try {
+              Add-Type -AssemblyName System.Windows.Forms
+              $screen = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+              $x = Get-Random -Minimum 100 -Maximum ($screen.Width - 100)
+              $y = Get-Random -Minimum 100 -Maximum ($screen.Height - 100)
+              [System.Windows.Forms.Cursor]::Position = New-Object System.Drawing.Point($x, $y)
+              return $true
+            } catch {
+              return $false
+            }
+          }
+          
+          $endTime = (Get-Date).AddHours(5)
+          Write-Host "Session will run until: $endTime"
+          
+          while ((Get-Date) -lt $endTime) {
+            Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Keeping session alive..."
+            
+            $mouseSuccess = Move-Mouse
+            
+            if (-not $mouseSuccess) {
+              Write-Host "Mouse movement failed, using alternative method"
+              
+              try {
+                Add-Type -AssemblyName System.Windows.Forms
+                [System.Windows.Forms.SendKeys]::SendWait("{NUMLOCK}{NUMLOCK}")
+              } catch {
+                Write-Host "Key press failed, continuing anyway"
+              }
+            }
+            
+            $timeRemaining = ($endTime - (Get-Date)).TotalMinutes
+            Write-Host "Time remaining: $([math]::Round($timeRemaining)) minutes"
+            
+            Start-Sleep -Seconds 300
+          }
+          
+          Write-Host "Session timeout reached. Shutting down..."
