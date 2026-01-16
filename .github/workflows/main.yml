@@ -1,4 +1,4 @@
-name: RDP with Bitcoin Tools
+name: ejaz-check
 
 on: workflow_dispatch
 
